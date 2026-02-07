@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trifecta Live Studio</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <h1>Trifecta Live Studio</h1>
+          <p>OBS browser source + mock ML inference in real time.</p>
+        </div>
+        <div class="status">
+          <span id="connStatus">Connecting...</span>
+        </div>
+      </header>
+
+      <section class="controls">
+        <div class="control">
+          <label for="sourceSelect">Source</label>
+          <select id="sourceSelect">
+            <option value="camera">Camera</option>
+            <option value="screen">Screen</option>
+          </select>
+        </div>
+
+        <div class="control buttons">
+          <button id="startBtn">Start</button>
+          <button id="stopBtn" disabled>Stop</button>
+        </div>
+
+        <div class="control toggles">
+          <label><input type="checkbox" id="toggleFaces" checked /> Blur faces</label>
+          <label><input type="checkbox" id="toggleBg" /> Replace background</label>
+          <label><input type="checkbox" id="toggleText" /> Highlight text</label>
+        </div>
+
+        <div class="control stats">
+          <div>Frames sent: <span id="sentCount">0</span></div>
+          <div>Inference recv: <span id="recvCount">0</span></div>
+          <div>Latency: <span id="latency">0ms</span></div>
+        </div>
+      </section>
+
+      <section class="stage">
+        <div class="canvas-shell">
+          <canvas id="output"></canvas>
+          <div class="overlay">
+            <div>Output canvas (use this in OBS Browser Source)</div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <video id="sourceVideo" playsinline muted></video>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+# Single source of truth for client + server config.
+client:
+  sampling_ms: 150
+  max_in_flight: 2
+  image:
+    format: jpeg
+    jpeg_quality: 0.6
+    max_width: 256
+    max_height: 256
+
+backend:
+  base_url: https://amithadiraju1694-trifecta-backend.hf.space
+  endpoints:
+    seg: /run_segmentation
+    face: /run_facemask
+    text: /run_text
+  timeout_ms: 1500
+  max_concurrent_calls: 6
+  use_mock: false
