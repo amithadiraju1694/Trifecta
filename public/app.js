@@ -6,6 +6,9 @@ const ctx = canvas.getContext('2d');
 // Offscreen canvas used for render composition.
 const frameCanvas = document.createElement('canvas');
 const frameCtx = frameCanvas.getContext('2d');
+// Offscreen canvas for video-only layer (used for masking background replacement).
+const videoLayerCanvas = document.createElement('canvas');
+const videoLayerCtx = videoLayerCanvas.getContext('2d');
 // Offscreen canvas used for compressing frames before sending to ML.
 const captureCanvas = document.createElement('canvas');
 const captureCtx = captureCanvas.getContext('2d');
@@ -47,6 +50,11 @@ let lastSendAt = 0;
 let sending = false;
 const pendingFrames = new Set();
 
+// Latest decoded segmentation mask (as an alpha mask for FOREGROUND).
+// This is updated only when new inference arrives.
+let segMaskCanvas = null;
+
+// Sampling interval (ms) loaded from config.yaml via /config.json.
 let sampleIntervalMs = clientConfig.sampling_ms;
 let maxInFlight = clientConfig.max_in_flight;
 let imageFormat = clientConfig.image.format;
@@ -107,6 +115,15 @@ function connectSocket() {
       return;
     }
     if (msg.type === 'inference') {
+      // If a segmentation mask arrives, decode it once and cache as a canvas.
+      const segFormat = msg.seg && msg.seg.format ? String(msg.seg.format).toLowerCase() : '';
+      if (segFormat === 'packbits' && msg.seg.data_b64) {
+        segMaskCanvas = decodePackbitsToForegroundMaskCanvas(
+          msg.seg.data_b64,
+          msg.seg.is_background_mask === true
+        );
+      }
+
       inference = {
         faces: msg.faces || [],
         texts: msg.texts || [],
@@ -134,6 +151,95 @@ function updateCanvasSize() {
   canvas.height = renderHeight;
   frameCanvas.width = renderWidth;
   frameCanvas.height = renderHeight;
+  videoLayerCanvas.width = renderWidth;
+  videoLayerCanvas.height = renderHeight;
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+function readU16BE(bytes, offset) {
+  return (bytes[offset] << 8) | bytes[offset + 1];
+}
+
+// This decodes the packbits and applies a slight blur to the mask itself.
+// This creates the soft "Teams" edge around the person.
+function decodePackbitsToForegroundMaskCanvas(dataB64, isBackgroundMask) {
+  try {
+    const bytes = b64ToBytes(dataB64);
+    if (bytes.length < 6) return null;
+
+    const h = readU16BE(bytes, 0);
+    const w = readU16BE(bytes, 2);
+    const rowStride = readU16BE(bytes, 4);
+    const packed = bytes.subarray(6);
+
+    // Basic validation
+    if (h === 0 || w === 0 || rowStride === 0) return null;
+
+    // Create a temporary buffer for the raw mask
+    const rawMask = document.createElement('canvas');
+    rawMask.width = w;
+    rawMask.height = h;
+    const rawCtx = rawMask.getContext('2d');
+    const img = rawCtx.createImageData(w, h);
+    const out = img.data;
+
+    for (let y = 0; y < h; y += 1) {
+      const rowStart = y * rowStride;
+      for (let xb = 0; xb < rowStride; xb += 1) {
+        // Safety check for buffer boundaries
+        if (rowStart + xb >= packed.length) break;
+        
+        const b = packed[rowStart + xb];
+        for (let bit = 0; bit < 8; bit += 1) {
+          const x = xb * 8 + bit;
+          if (x >= w) break;
+          
+          const isOne = (b & (1 << (7 - bit))) !== 0;
+          // Determine if this pixel is Background
+          // If ML sends is_background_mask=true, then 1=BG, 0=FG
+          const isBg = isBackgroundMask ? isOne : !isOne;
+          
+          // We want the MASK to be OPAQUE at the FOREGROUND
+          const alpha = isBg ? 0 : 255;
+          
+          const idx = (y * w + x) * 4;
+          out[idx] = 0;     // R (irrelevant for mask, but keep black)
+          out[idx + 1] = 0; // G
+          out[idx + 2] = 0; // B
+          out[idx + 3] = alpha; // Alpha determines visibility
+        }
+      }
+    }
+    
+    rawCtx.putImageData(img, 0, 0);
+
+    // PROCESS: Feather the mask
+    // We draw the raw mask onto a final canvas with a slight blur.
+    // This removes jagged edges.
+    const featherCanvas = document.createElement('canvas');
+    featherCanvas.width = w;
+    featherCanvas.height = h;
+    const featherCtx = featherCanvas.getContext('2d');
+    
+    featherCtx.save();
+    // 4px blur creates a soft edge transition
+    featherCtx.filter = 'blur(4px)'; 
+    featherCtx.drawImage(rawMask, 0, 0);
+    featherCtx.restore();
+
+    return featherCanvas;
+  } catch (err) {
+    console.error("Mask Decode Error:", err);
+    return null;
+  }
 }
 
 // Flags choose which ML outputs to request.
@@ -220,11 +326,14 @@ function drawBox(ctx2d, box, width, height, color, fill = false) {
 // Sends one compressed frame to the ML endpoint.
 // IMPORTANT: this is the line path that calls the ML backend.
 // Data type: a base64-encoded JPEG string derived from the video frame.
+// Sends one sampled frame to the ML backend over WebSocket.
+// This is the primary ML inference request path.
 async function sendFrame() {
   if (sending || !socket || socket.readyState !== WebSocket.OPEN) return;
   const flags = getFlags();
   if (!flags.run_face && !flags.run_seg && !flags.run_text) return;
   if (!video.videoWidth || !video.videoHeight) return;
+  // Avoid piling up requests: respect max in-flight.
   if (pendingFrames.size >= maxInFlight) return;
 
   sending = true;
@@ -277,7 +386,7 @@ async function sendFrame() {
     image
   };
 
-  // Actual send to ML backend happens here.
+  // Actual send to ML backend happens here (WebSocket JSON payload).
   socket.send(JSON.stringify(message));
   pendingFrames.add(message.id);
   sendCounter += 1;
@@ -285,7 +394,7 @@ async function sendFrame() {
   sending = false;
 }
 
-// Main render loop: draws processed output to the canvas.
+// Handles the "Frosted Glass" Background + Sharp Foreground composition
 function render() {
   requestAnimationFrame(render);
   if (!running || video.readyState < 2) return;
@@ -296,38 +405,56 @@ function render() {
 
   const flags = getFlags();
 
-  frameCtx.clearRect(0, 0, width, height);
-  if (flags.run_seg && inference.seg && inference.seg.kind === 'circle') {
-    drawBackground(frameCtx, width, height);
+  // 1. Clear Main Canvas
+  ctx.clearRect(0, 0, width, height);
+
+  if (flags.run_seg) {
+    // --- STEP A: Draw The Blurred Background ---
+    frameCtx.clearRect(0, 0, width, height);
+    
     frameCtx.save();
-    frameCtx.beginPath();
-    const radius = inference.seg.r * Math.min(width, height);
-    frameCtx.ellipse(
-      inference.seg.cx * width,
-      inference.seg.cy * height,
-      radius,
-      radius,
-      0,
-      0,
-      Math.PI * 2
-    );
-    frameCtx.clip();
-    frameCtx.drawImage(video, 0, 0, width, height);
+    // Heavy blur (30px) makes objects "invisible yet not knowing shape" (Frosted Glass)
+    // We scale slightly (1.05) to hide edge artifacts at the borders
+    frameCtx.filter = 'blur(30px)'; 
+    const scale = 1.05;
+    const sw = width * scale;
+    const sh = height * scale;
+    frameCtx.drawImage(video, (width - sw) / 2, (height - sh) / 2, sw, sh);
     frameCtx.restore();
+
+    // --- STEP B: Draw The Sharp Foreground (If Mask Exists) ---
+    if (segMaskCanvas) {
+      // Prepare the Video Layer (Sharp)
+      videoLayerCtx.clearRect(0, 0, width, height);
+      videoLayerCtx.drawImage(video, 0, 0, width, height);
+
+      // Composite the Mask: Keep Sharp Video ONLY where Mask is Opaque
+      videoLayerCtx.save();
+      videoLayerCtx.globalCompositeOperation = 'destination-in';
+      // Draw mask stretched to fit current resolution
+      videoLayerCtx.drawImage(segMaskCanvas, 0, 0, width, height);
+      videoLayerCtx.restore();
+
+      // Draw the Cut-out Foreground on top of the Blurred Background
+      frameCtx.drawImage(videoLayerCanvas, 0, 0, width, height);
+    } 
+    else {
+      // Fallback: If Seg is ON but no mask yet, show full blur (privacy mode)
+      // or optionally show nothing. Currently shows full blur.
+    }
+
+    // Output to main display
+    ctx.drawImage(frameCanvas, 0, 0, width, height);
+
   } else {
-    frameCtx.drawImage(video, 0, 0, width, height);
+    // Standard Pass-through (No Blur)
+    ctx.drawImage(video, 0, 0, width, height);
   }
 
-  ctx.clearRect(0, 0, width, height);
-  ctx.drawImage(frameCanvas, 0, 0, width, height);
-
+  // Draw Overlays (Faces/Text) - Kept from your original logic
   if (flags.run_face && inference.faces.length) {
     inference.faces.forEach((face) => {
-      const rect = boxToRect(face, width, height);
-      ctx.save();
-      ctx.filter = 'blur(16px)';
-      ctx.drawImage(frameCanvas, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-      ctx.restore();
+      // Optional: Blur faces extra if requested, or just draw box
       drawBox(ctx, face, width, height, 'rgba(255, 122, 89, 0.9)');
     });
   }
@@ -338,10 +465,13 @@ function render() {
     });
   }
 
+  // Sampling gate: only send frames every sampleIntervalMs.
   if (Date.now() - lastSendAt > sampleIntervalMs) {
     sendFrame();
   }
 }
+
+
 
 startBtn.addEventListener('click', () => {
   startCapture().catch((err) => {

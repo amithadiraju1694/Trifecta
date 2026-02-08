@@ -10,8 +10,10 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
+// Load runtime configuration from YAML (single source of truth).
 const CONFIG_PATH = process.env.TRIFECTA_CONFIG || path.join(__dirname, 'config.yaml');
 
+// Deep merge to overlay YAML on defaults.
 function mergeDeep(base, override) {
   if (!override) return base;
   const output = Array.isArray(base) ? [...base] : { ...base };
@@ -26,6 +28,7 @@ function mergeDeep(base, override) {
   return output;
 }
 
+// Load config.yaml; fall back to defaults if missing/invalid.
 function loadConfig() {
   const defaults = {
     client: {
@@ -64,6 +67,7 @@ const config = loadConfig();
 const clientConfig = config.client || {};
 const backendConfig = config.backend || {};
 
+// Backend endpoints and limits (overridable by env vars).
 const HF_BASE_URL = process.env.HF_BASE_URL || backendConfig.base_url;
 const HF_ENDPOINTS = backendConfig.endpoints || {
   seg: '/run_segmentation',
@@ -77,6 +81,7 @@ const HF_MAX_CONCURRENT = Number(
 const USE_MOCK =
   (process.env.USE_MOCK || '').toLowerCase() === 'true' || backendConfig.use_mock === true;
 
+// Simple concurrency limiter for outbound HF calls.
 function createLimiter(maxConcurrent) {
   const max = Math.max(1, maxConcurrent || 1);
   let active = 0;
@@ -160,21 +165,20 @@ function makeMockInference({ run_seg, run_face, run_text }) {
 }
 
 // Builds the request payload for the HF Space endpoints.
-// IMPORTANT: Input image data type is base64 JPEG/PNG (data URL string).
+// IMPORTANT: Input image data type is raw JPEG/PNG bytes (no JSON wrapper).
 function buildHfPayload(msg) {
   const format = (msg.image_format || 'jpeg').toLowerCase();
   const mime = format === 'png' ? 'image/png' : 'image/jpeg';
-  const dataUrl = `data:${mime};base64,${msg.image}`;
+  const bytes = Buffer.from(msg.image, 'base64');
   return {
-    image: dataUrl,
-    image_format: format,
-    width: msg.width,
-    height: msg.height,
-    ts: msg.ts
+    body: bytes,
+    headers: {
+      'Content-Type': mime
+    }
   };
 }
 
-// Calls a specific HF Space endpoint and returns parsed JSON.
+// Calls a specific HF Space endpoint and returns parsed JSON or binary mask payloads.
 async function callHf(endpoint, payload) {
   return hfLimiter(async () => {
     const url = `${HF_BASE_URL}${endpoint}`;
@@ -183,8 +187,8 @@ async function callHf(endpoint, payload) {
 
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      headers: payload.headers,
+      body: payload.body,
       signal: controller.signal
     });
 
@@ -192,19 +196,58 @@ async function callHf(endpoint, payload) {
     if (!res.ok) {
       throw new Error(`HF request failed: ${endpoint} ${res.status}`);
     }
-    return res.json();
+    // Segmentation may return a binary mask (e.g., packbits) rather than JSON.
+    const maskFormat = res.headers.get('x-mask-format');
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+    // If X-Mask-Format is present, forward raw bytes as base64 to the client.
+    if (maskFormat) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      return {
+        kind: 'mask',
+        format: String(maskFormat).toLowerCase(),
+        data_b64: buf.toString('base64')
+      };
+    }
+
+    // Standard JSON response.
+    if (contentType.includes('application/json')) {
+      return res.json();
+    }
+
+    // Fallback: treat as raw bytes and forward as base64 for debugging/compat.
+    const buf = Buffer.from(await res.arrayBuffer());
+    return {
+      kind: 'bytes',
+      content_type: contentType,
+      data_b64: buf.toString('base64')
+    };
   });
 }
 
+// Normalize face detection outputs to a consistent array shape.
 function normalizeFaces(result) {
   return result.faces || result.boxes || result.detections || [];
 }
 
+// Normalize text detection outputs to a consistent array shape.
 function normalizeTexts(result) {
   return result.texts || result.boxes || result.detections || [];
 }
 
+// Normalize segmentation outputs (packbits or JSON).
 function normalizeSeg(result) {
+  if (!result) return null;
+  // Packbits (or other) binary mask from backend.
+  if (result.kind === 'mask') {
+    return {
+      format: result.format,
+      data_b64: result.data_b64,
+      // Your backend's mask is 1 for background class.
+      is_background_mask: true
+    };
+  }
+  // JSON-style responses (if your backend ever returns them).
   return result.seg || result.mask || result;
 }
 
@@ -257,6 +300,8 @@ wss.on('connection', (ws) => {
         const key = keys[index];
         if (item.status === 'fulfilled') {
           results[key] = item.value;
+        } else {
+          console.warn(`[HF] ${key} failed: ${item.reason?.message || item.reason}`);
         }
       });
 
